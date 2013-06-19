@@ -40,6 +40,7 @@ type conn struct {
 	buf   *bufio.Reader
 	namei int
 	pool  *connPoolItem
+	err   error
 }
 
 type connPoolItem struct {
@@ -230,7 +231,10 @@ func (cn *conn) gname() string {
 }
 
 func (cn *conn) simpleQuery(q string) (res driver.Result, err error) {
-	defer errRecover(&err)
+	defer func() {
+		errRecover(&err)
+		cn.err = err
+	}()
 
 	b := newWriteBuf('Q')
 	b.string(q)
@@ -256,7 +260,10 @@ func (cn *conn) simpleQuery(q string) (res driver.Result, err error) {
 }
 
 func (cn *conn) prepareTo(q, stmtName string) (_ driver.Stmt, err error) {
-	defer errRecover(&err)
+	defer func() {
+		errRecover(&err)
+		cn.err = err
+	}()
 
 	st := &stmt{cn: cn, name: stmtName, query: q}
 
@@ -316,10 +323,14 @@ func (cn *conn) Prepare(q string) (driver.Stmt, error) {
 }
 
 func (cn *conn) Close() (err error) {
-	defer errRecover(&err)
+	defer func() {
+		errRecover(&err)
+		cn.err = err
+	}()
 
 	// For persistent connection, do not close it; put it back into the free list
-	if cn.pool.persist && cn.pool.maxcons > 0 {
+	// An error condition on the connection will Close it outright.
+	if cn.err == nil && cn.pool.persist && cn.pool.maxcons > 0 {
 		cn.pool.mu.Lock()
 		cn.pool.free = append(cn.pool.free, cn)
 		cn.pool.mu.Unlock()
@@ -328,21 +339,25 @@ func (cn *conn) Close() (err error) {
 		return nil
 	}
 
-	cn.send(newWriteBuf('X'))
-
-	err = cn.c.Close()
 	if cn.pool.maxcons > 0 {
 		cn.pool.mu.Lock()
 		cn.pool.conns--
 		cn.pool.mu.Unlock()
 		<-cn.pool.sem
 	}
+
+	cn.send(newWriteBuf('X'))
+	err = cn.c.Close()
+
 	return err
 }
 
 // Implement the optional "Execer" interface for one-shot queries
 func (cn *conn) Exec(query string, args []driver.Value) (_ driver.Result, err error) {
-	defer errRecover(&err)
+	defer func() {
+		errRecover(&err)
+		cn.err = err
+	}()
 
 	// Check to see if we can use the "simpleQuery" interface, which is
 	// *much* faster than going through prepare/exec
