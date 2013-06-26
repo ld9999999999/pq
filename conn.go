@@ -10,7 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/lib/pq/oid"
+	"github.com/ld9999999999/pq/oid"
 	"io"
 	"net"
 	"os"
