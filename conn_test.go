@@ -166,7 +166,7 @@ func TestEncodeDecode(t *testing.T) {
 	defer db.Close()
 
 	q := `
-		SELECT 
+		SELECT
 			'\x000102'::bytea,
 			'foobar'::text,
 			NULL::integer,
@@ -174,7 +174,7 @@ func TestEncodeDecode(t *testing.T) {
 			0::boolean,
 			123,
 			3.14::float8
-		WHERE 
+		WHERE
 			    '\x000102'::bytea = $1
 			AND 'foobar'::text = $2
 			AND $3::integer is NULL
@@ -351,6 +351,21 @@ func TestErrorOnQuery(t *testing.T) {
 	}
 }
 
+func TestSimpleQuery(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	r, err := db.Query("select 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if !r.Next() {
+		t.Fatal("expected row")
+	}
+}
+
 func TestBindError(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
@@ -518,11 +533,36 @@ func TestRollback(t *testing.T) {
 	}
 }
 
-func TestConnTrailingSpace(t *testing.T) {
-	o := make(Values)
-	expected := Values{"dbname": "hello", "user": "goodbye"}
-	parseOpts("dbname=hello user=goodbye ", o)
-	if !reflect.DeepEqual(expected, o) {
-		t.Fatalf("Expected: %#v Got: %#v", expected, o)
+func TestParseOpts(t *testing.T) {
+	tests := []struct {
+		in       string
+		expected Values
+		valid    bool
+	}{
+		{"dbname=hello user=goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname=hello user=goodbye  ", Values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname = hello user=goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname=hello user =goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname=hello user= goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
+		{"host=localhost password='correct horse battery staple'", Values{"host": "localhost", "password": "correct horse battery staple"}, true},
+		{"dbname=データベース password=パスワード", Values{"dbname": "データベース", "password": "パスワード"}, true},
+		// The parser ignores spaces after = and interprets the next set of non-whitespace characters as the value.
+		// This seems to be how the C library does it.
+		{"user= password=foo", Values{"user": "password=foo"}, true},
+
+		// No '=' after the key
+		{"dbname user=goodbye", Values{}, false},
+		// Unterminated quoted value
+		{"dbname=hello user='unterminated", Values{}, false},
+	}
+
+	for _, test := range tests {
+		o := make(Values)
+		err := parseOpts(test.in, o)
+		if err != nil && test.valid {
+			t.Errorf("%q got unexpected error: %s", test.in, err)
+		} else if err == nil && !reflect.DeepEqual(test.expected, o) {
+			t.Errorf("%q got: %#v want: %#v", test.in, o, test.expected)
+		}
 	}
 }

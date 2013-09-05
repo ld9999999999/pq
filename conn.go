@@ -17,6 +17,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -35,9 +36,16 @@ func init() {
 }
 
 type conn struct {
-	c     net.Conn
-	buf   *bufio.Reader
-	namei int
+	c       net.Conn
+	buf     *bufio.Reader
+	namei   int
+	scratch [512]byte
+}
+
+func (c *conn) writeBuf(b byte) *writeBuf {
+	c.scratch[0] = b
+	w := writeBuf(c.scratch[:5])
+	return &w
 }
 
 func Open(name string) (_ driver.Conn, err error) {
@@ -58,7 +66,9 @@ func Open(name string) (_ driver.Conn, err error) {
 		o.Set(k, v)
 	}
 
-	parseOpts(name, o)
+	if err := parseOpts(name, o); err != nil {
+		return nil, err
+	}
 
 	// If a user is not provided by any other means, the last
 	// resort is to use the current operating system provided user
@@ -102,25 +112,110 @@ func (vs Values) Set(k, v string) {
 }
 
 func (vs Values) Get(k string) (v string) {
-	v, _ = vs[k]
-	return
+	return vs[k]
 }
 
-func parseOpts(name string, o Values) {
-	if len(name) == 0 {
-		return
+type scanner struct {
+	s []rune
+	i int
+}
+
+func NewScanner(s string) *scanner {
+	return &scanner{[]rune(s), 0}
+}
+
+// Next returns the next rune.
+// It returns 0, false if the end of the text has been reached.
+func (s *scanner) Next() (rune, bool) {
+	if s.i >= len(s.s) {
+		return 0, false
 	}
+	r := s.s[s.i]
+	s.i++
+	return r, true
+}
 
-	name = strings.TrimSpace(name)
+// SkipSpaces returns the next non-whitespace rune.
+// It returns 0, false if the end of the text has been reached.
+func (s *scanner) SkipSpaces() (rune, bool) {
+	r, ok := s.Next()
+	for unicode.IsSpace(r) && ok {
+		r, ok = s.Next()
+	}
+	return r, ok
+}
 
-	ps := strings.Split(name, " ")
-	for _, p := range ps {
-		kv := strings.Split(p, "=")
-		if len(kv) < 2 {
-			errorf("invalid option: %q", p)
+func parseOpts(name string, o Values) error {
+	s := NewScanner(name)
+
+top:
+	for {
+		var (
+			keyRunes, valRunes []rune
+			r                  rune
+			ok                 bool
+		)
+
+		if r, ok = s.SkipSpaces(); !ok {
+			break
 		}
-		o.Set(kv[0], kv[1])
+
+		// Scan the key
+		for !unicode.IsSpace(r) && r != '=' {
+			keyRunes = append(keyRunes, r)
+			if r, ok = s.Next(); !ok {
+				break top
+			}
+		}
+
+		// Skip any whitespace if we're not at the = yet
+		if r != '=' {
+			if r, ok = s.SkipSpaces(); !ok {
+				break
+			}
+		}
+
+		// The current character should be =
+		if r != '=' {
+			return fmt.Errorf(`missing "=" after %q in connection info string"`, string(keyRunes))
+		}
+
+		// Skip any whitespace after the =
+		if r, ok = s.SkipSpaces(); !ok {
+			break top
+		}
+
+		if r != '\'' {
+			for !unicode.IsSpace(r) {
+				if r != '\\' {
+					valRunes = append(valRunes, r)
+				}
+
+				if r, ok = s.Next(); !ok {
+					break
+				}
+			}
+		} else {
+		quote:
+			for {
+				if r, ok = s.Next(); !ok {
+					return fmt.Errorf(`unterminated quoted string literal in connection string`)
+				}
+				switch r {
+				case '\\':
+					continue
+				case '\'':
+					break quote
+				default:
+					valRunes = append(valRunes, r)
+				}
+			}
+		}
+
+		o.Set(string(keyRunes), string(valRunes))
 	}
+
+	return nil
 }
 
 func (cn *conn) Begin() (driver.Tx, error) {
@@ -146,10 +241,10 @@ func (cn *conn) gname() string {
 	return strconv.FormatInt(int64(cn.namei), 10)
 }
 
-func (cn *conn) simpleQuery(q string) (res driver.Result, err error) {
+func (cn *conn) simpleExec(q string) (res driver.Result, err error) {
 	defer errRecover(&err)
 
-	b := newWriteBuf('Q')
+	b := cn.writeBuf('Q')
 	b.string(q)
 	cn.send(b)
 
@@ -172,45 +267,75 @@ func (cn *conn) simpleQuery(q string) (res driver.Result, err error) {
 	panic("not reached")
 }
 
+func (cn *conn) simpleQuery(q string) (res driver.Rows, err error) {
+	defer errRecover(&err)
+
+	st := &stmt{cn: cn, name: "", query: q}
+
+	b := cn.writeBuf('Q')
+	b.string(q)
+	cn.send(b)
+
+	res = &rows{st: st}
+
+	for {
+		t, r := cn.recv1()
+		switch t {
+		case 'C':
+			// done
+			return
+		case 'Z':
+			// done
+			return
+		case 'E':
+			st.lasterr = parseError(r)
+			return
+		case 'T':
+			st.cols, st.rowTyps = parseMeta(r)
+			// After we get the meta, we want to kick out to Next()
+			return
+		default:
+			errorf("unknown response for simple query: %q", t)
+		}
+	}
+	panic("not reached")
+}
+
 func (cn *conn) prepareTo(q, stmtName string) (_ driver.Stmt, err error) {
+	return cn.prepareToSimpleStmt(q, stmtName)
+}
+
+func (cn *conn) prepareToSimpleStmt(q, stmtName string) (_ *stmt, err error) {
 	defer errRecover(&err)
 
 	st := &stmt{cn: cn, name: stmtName, query: q}
 
-	b := newWriteBuf('P')
+	b := cn.writeBuf('P')
 	b.string(st.name)
 	b.string(q)
 	b.int16(0)
 	cn.send(b)
 
-	b = newWriteBuf('D')
+	b = cn.writeBuf('D')
 	b.byte('S')
 	b.string(st.name)
 	cn.send(b)
 
-	cn.send(newWriteBuf('S'))
+	cn.send(cn.writeBuf('S'))
 
 	for {
 		t, r := cn.recv1()
 		switch t {
 		case '1', '2', 'N':
 		case 't':
-			st.nparams = int(r.int16())
-			st.paramTyps = make([]oid.Oid, st.nparams, st.nparams)
+			nparams := int(r.int16())
+			st.paramTyps = make([]oid.Oid, nparams)
 
-			for i := 0; i < st.nparams; i += 1 {
+			for i := range st.paramTyps {
 				st.paramTyps[i] = r.oid()
 			}
 		case 'T':
-			n := r.int16()
-			st.cols = make([]string, n)
-			st.rowTyps = make([]oid.Oid, n)
-			for i := range st.cols {
-				st.cols[i] = r.string()
-				r.next(6)
-				st.rowTyps[i] = r.oid()
-				r.next(8)
-			}
+			st.cols, st.rowTyps = parseMeta(r)
 		case 'n':
 			// no data
 		case 'Z':
@@ -234,19 +359,38 @@ func (cn *conn) Prepare(q string) (driver.Stmt, error) {
 
 func (cn *conn) Close() (err error) {
 	defer errRecover(&err)
-	cn.send(newWriteBuf('X'))
+	cn.send(cn.writeBuf('X'))
 
 	return cn.c.Close()
 }
 
-// Implement the optional "Execer" interface for one-shot queries
-func (cn *conn) Exec(query string, args []driver.Value) (_ driver.Result, err error) {
+// Implement the "Queryer" interface
+func (cn *conn) Query(query string, args []driver.Value) (_ driver.Rows, err error) {
 	defer errRecover(&err)
 
 	// Check to see if we can use the "simpleQuery" interface, which is
 	// *much* faster than going through prepare/exec
 	if len(args) == 0 {
 		return cn.simpleQuery(query)
+	}
+
+	st, err := cn.prepareToSimpleStmt(query, "")
+	if err != nil {
+		panic(err)
+	}
+
+	st.exec(args)
+	return &rows{st: st}, nil
+}
+
+// Implement the optional "Execer" interface for one-shot queries
+func (cn *conn) Exec(query string, args []driver.Value) (_ driver.Result, err error) {
+	defer errRecover(&err)
+
+	// Check to see if we can use the "simpleExec" interface, which is
+	// *much* faster than going through prepare/exec
+	if len(args) == 0 {
+		return cn.simpleExec(query)
 	}
 
 	// Use the unnamed statement to defer planning until bind
@@ -297,20 +441,27 @@ func (cn *conn) recv() (t byte, r *readBuf) {
 }
 
 func (cn *conn) recv1() (byte, *readBuf) {
-	x := make([]byte, 5)
+	x := cn.scratch[:5]
 	_, err := io.ReadFull(cn.buf, x)
 	if err != nil {
 		panic(err)
 	}
+	c := x[0]
 
 	b := readBuf(x[1:])
-	y := make([]byte, b.int32()-4)
+	n := b.int32() - 4
+	var y []byte
+	if n <= len(cn.scratch) {
+		y = cn.scratch[:n]
+	} else {
+		y = make([]byte, n)
+	}
 	_, err = io.ReadFull(cn.buf, y)
 	if err != nil {
 		panic(err)
 	}
 
-	return x[0], (*readBuf)(&y)
+	return c, (*readBuf)(&y)
 }
 
 func (cn *conn) ssl(o Values) {
@@ -326,11 +477,11 @@ func (cn *conn) ssl(o Values) {
 		errorf(`unsupported sslmode %q; only "require" (default), "verify-full", and "disable" supported`, mode)
 	}
 
-	w := newWriteBuf(0)
+	w := cn.writeBuf(0)
 	w.int32(80877103)
 	cn.send(w)
 
-	b := make([]byte, 1)
+	b := cn.scratch[:1]
 	_, err := io.ReadFull(cn.c, b)
 	if err != nil {
 		panic(err)
@@ -344,7 +495,7 @@ func (cn *conn) ssl(o Values) {
 }
 
 func (cn *conn) startup(o Values) {
-	w := newWriteBuf(0)
+	w := cn.writeBuf(0)
 	w.int32(196608)
 	w.string("user")
 	w.string(o.Get("user"))
@@ -372,7 +523,7 @@ func (cn *conn) auth(r *readBuf, o Values) {
 	case 0:
 		// OK
 	case 3:
-		w := newWriteBuf('p')
+		w := cn.writeBuf('p')
 		w.string(o.Get("password"))
 		cn.send(w)
 
@@ -386,7 +537,7 @@ func (cn *conn) auth(r *readBuf, o Values) {
 		}
 	case 5:
 		s := string(r.next(4))
-		w := newWriteBuf('p')
+		w := cn.writeBuf('p')
 		w.string("md5" + md5s(md5s(o.Get("password")+o.Get("user"))+s))
 		cn.send(w)
 
@@ -408,10 +559,10 @@ type stmt struct {
 	name      string
 	query     string
 	cols      []string
-	nparams   int
 	rowTyps   []oid.Oid
 	paramTyps []oid.Oid
 	closed    bool
+	lasterr   error
 }
 
 func (st *stmt) Close() (err error) {
@@ -421,12 +572,12 @@ func (st *stmt) Close() (err error) {
 
 	defer errRecover(&err)
 
-	w := newWriteBuf('C')
+	w := st.cn.writeBuf('C')
 	w.byte('S')
 	w.string(st.name)
 	st.cn.send(w)
 
-	st.cn.send(newWriteBuf('S'))
+	st.cn.send(st.cn.writeBuf('S'))
 
 	t, _ := st.cn.recv()
 	if t != '3' {
@@ -452,7 +603,7 @@ func (st *stmt) Exec(v []driver.Value) (res driver.Result, err error) {
 	defer errRecover(&err)
 
 	if len(v) == 0 {
-		return st.cn.simpleQuery(st.query)
+		return st.cn.simpleExec(st.query)
 	}
 	st.exec(v)
 
@@ -477,7 +628,7 @@ func (st *stmt) Exec(v []driver.Value) (res driver.Result, err error) {
 }
 
 func (st *stmt) exec(v []driver.Value) {
-	w := newWriteBuf('B')
+	w := st.cn.writeBuf('B')
 	w.string("")
 	w.string(st.name)
 	w.int16(0)
@@ -494,12 +645,12 @@ func (st *stmt) exec(v []driver.Value) {
 	w.int16(0)
 	st.cn.send(w)
 
-	w = newWriteBuf('E')
+	w = st.cn.writeBuf('E')
 	w.string("")
 	w.int32(0)
 	st.cn.send(w)
 
-	st.cn.send(newWriteBuf('S'))
+	st.cn.send(st.cn.writeBuf('S'))
 
 	var err error
 	for {
@@ -526,23 +677,13 @@ func (st *stmt) exec(v []driver.Value) {
 }
 
 func (st *stmt) NumInput() int {
-	return st.nparams
-}
-
-type result int64
-
-func (i result) RowsAffected() (int64, error) {
-	return int64(i), nil
-}
-
-func (i result) LastInsertId() (int64, error) {
-	return 0, ErrNotSupported
+	return len(st.paramTyps)
 }
 
 func parseComplete(s string) driver.Result {
 	parts := strings.Split(s, " ")
 	n, _ := strconv.ParseInt(parts[len(parts)-1], 10, 64)
-	return result(n)
+	return driver.RowsAffected(n)
 }
 
 type rows struct {
@@ -573,6 +714,10 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 		return io.EOF
 	}
 
+	if rs.st.lasterr != nil {
+		return rs.st.lasterr
+	}
+
 	defer errRecover(&err)
 
 	for {
@@ -590,7 +735,10 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 			return io.EOF
 		case 'D':
 			n := r.int16()
-			for i := 0; i < len(dest) && i < n; i++ {
+			if n < len(dest) {
+				dest = dest[:n]
+			}
+			for i := range dest {
 				l := r.int32()
 				if l == -1 {
 					dest[i] = nil
@@ -611,6 +759,19 @@ func md5s(s string) string {
 	h := md5.New()
 	h.Write([]byte(s))
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func parseMeta(r *readBuf) (cols []string, rowTyps []oid.Oid) {
+	n := r.int16()
+	cols = make([]string, n)
+	rowTyps = make([]oid.Oid, n)
+	for i := range cols {
+		cols[i] = r.string()
+		r.next(6)
+		rowTyps[i] = r.oid()
+		r.next(8)
+	}
+	return
 }
 
 // parseEnviron tries to mimic some of libpq's environment handling

@@ -1,5 +1,7 @@
 # pq - A pure Go postgres driver for Go's database/sql package
 
+[![Build Status](https://travis-ci.org/lib/pq.png?branch=master)](https://travis-ci.org/lib/pq)
+
 ## Install
 
 	go get github.com/lib/pq
@@ -43,6 +45,10 @@ See http://www.postgresql.org/docs/9.1/static/libpq-connect.html.
 	* `require` - Always SSL (skip verification)
 	* `verify-full` - Always SSL (require verification)
 
+Use single quotes for values that contain whitespace:
+
+    "user=pqgotest password='with spaces'"
+
 See http://golang.org/pkg/database/sql to learn how to use with `pq` through the `database/sql` package.
 
 ## Tests
@@ -54,7 +60,11 @@ variables.
 
 Example:
 
-	PGHOST=/var/run/postgresql go test pq
+	PGHOST=/var/run/postgresql go test github.com/lib/pq
+
+Optionally, a benchmark suite can be run as part of the tests:
+
+	PGHOST=/var/run/postgresql go test -bench .
 
 ## Features
 
@@ -85,6 +95,7 @@ code still exists in here.
 * Chris Walsh (cwds)
 * Daniel Farina (fdr)
 * Everyone at The Go Team
+* Evan Shaw (edsrzf)
 * Ewan Chou (coocood)
 * Federico Romero (federomero)
 * Gary Burd (garyburd)
@@ -96,6 +107,7 @@ code still exists in here.
 * Keith Rarick (kr)
 * Maciek Sakrejda (deafbybeheading)
 * Marc Brinkmann (mbr)
+* Matt Robenolt (mattrobenolt)
 * Martin Olsen (martinolsen)
 * Mike Lewis (mikelikespie)
 * Ryan Smith (ryandotsmith)
