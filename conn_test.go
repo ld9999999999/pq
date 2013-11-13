@@ -3,9 +3,11 @@ package pq
 import (
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"os"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -14,7 +16,7 @@ type Fatalistic interface {
 	Fatal(args ...interface{})
 }
 
-func openTestConn(t Fatalistic) *sql.DB {
+func openTestConnConninfo(conninfo string) (*sql.DB, error) {
 	datname := os.Getenv("PGDATABASE")
 	sslmode := os.Getenv("PGSSLMODE")
 
@@ -26,12 +28,89 @@ func openTestConn(t Fatalistic) *sql.DB {
 		os.Setenv("PGSSLMODE", "disable")
 	}
 
-	conn, err := sql.Open("postgres", "")
+	return sql.Open("postgres", conninfo)
+}
+
+func openTestConn(t Fatalistic) *sql.DB {
+	conn, err := openTestConnConninfo("")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	return conn
+}
+
+func TestReconnect(t *testing.T) {
+	if runtime.Version() == "go1.0.2" {
+		fmt.Println("Skipping failing test; " +
+			"fixed in database/sql on go1.0.3+")
+		return
+	}
+
+	db1 := openTestConn(t)
+	defer db1.Close()
+	tx, err := db1.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid1 int
+	err = tx.QueryRow("SELECT pg_backend_pid()").Scan(&pid1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2 := openTestConn(t)
+	defer db2.Close()
+	_, err = db2.Exec("SELECT pg_terminate_backend($1)", pid1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The rollback will probably "fail" because we just killed
+	// its connection above
+	_ = tx.Rollback()
+
+	const expected int = 42
+	var result int
+	err = db1.QueryRow(fmt.Sprintf("SELECT %d", expected)).Scan(&result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != expected {
+		t.Errorf("got %v; expected %v", result, expected)
+	}
+}
+
+func TestCommitInFailedTransaction(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := txn.Query("SELECT error")
+	if err == nil {
+		rows.Close()
+		t.Fatal("expected failure")
+	}
+	err = txn.Commit()
+	if err != ErrInFailedTransaction {
+		t.Fatal("expected ErrInFailedTransaction; got %#v", err)
+	}
+}
+
+func TestOpenURL(t *testing.T) {
+	db, err := openTestConnConninfo("postgres://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// database/sql might not call our Open at all unless we do something with
+	// the connection
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn.Rollback()
 }
 
 func TestExec(t *testing.T) {
@@ -167,7 +246,7 @@ func TestEncodeDecode(t *testing.T) {
 
 	q := `
 		SELECT
-			'\x000102'::bytea,
+			E'\\x000102'::bytea,
 			'foobar'::text,
 			NULL::integer,
 			'2000-1-1 01:02:03.04-7'::timestamptz,
@@ -175,7 +254,7 @@ func TestEncodeDecode(t *testing.T) {
 			123,
 			3.14::float8
 		WHERE
-			    '\x000102'::bytea = $1
+			    E'\\x000102'::bytea = $1
 			AND 'foobar'::text = $2
 			AND $3::integer is NULL
 	`
@@ -259,12 +338,22 @@ func TestNoData(t *testing.T) {
 		}
 		t.Fatal("unexpected row")
 	}
+
+	_, err = db.Query("SELECT * FROM nonexistenttable WHERE age=$1", 20)
+	if err == nil {
+		t.Fatal("Should have raised an error on non existent table")
+	}
+
+	_, err = db.Query("SELECT * FROM nonexistenttable")
+	if err == nil {
+		t.Fatal("Should have raised an error on non existent table")
+	}
 }
 
-func TestPGError(t *testing.T) {
+func TestError(t *testing.T) {
 	// Don't use the normal connection setup, this is intended to
 	// blow up in the startup packet from a non-existent user.
-	db, err := sql.Open("postgres", "user=thisuserreallydoesntexist")
+	db, err := openTestConnConninfo("user=thisuserreallydoesntexist")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,8 +364,8 @@ func TestPGError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 
-	if err, ok := err.(PGError); !ok {
-		t.Fatalf("expected a PGError, got: %v", err)
+	if err != driver.ErrBadConn {
+		t.Fatalf("expected driver.ErrBadConn, got: %v", err)
 	}
 }
 
@@ -294,8 +383,7 @@ func TestBadConn(t *testing.T) {
 
 	func() {
 		defer errRecover(&err)
-		e := &pgError{c: make(map[byte]string)}
-		e.c['S'] = Efatal
+		e := &Error{Severity: Efatal}
 		panic(e)
 	}()
 
@@ -310,9 +398,9 @@ func TestErrorOnExec(t *testing.T) {
 
 	sql := "DO $$BEGIN RAISE unique_violation USING MESSAGE='foo'; END; $$;"
 	_, err := db.Exec(sql)
-	_, ok := err.(PGError)
+	_, ok := err.(*Error)
 	if !ok {
-		t.Fatalf("expected PGError, was: %#v", err)
+		t.Fatalf("expected Error, was: %#v", err)
 	}
 
 	_, err = db.Exec("SELECT 1 WHERE true = false") // returns no rows
@@ -327,18 +415,15 @@ func TestErrorOnQuery(t *testing.T) {
 
 	sql := "DO $$BEGIN RAISE unique_violation USING MESSAGE='foo'; END; $$;"
 	r, err := db.Query(sql)
-	if err != nil {
-		t.Fatal(err)
+	if r != nil {
+		t.Fatal("Should not return rows")
 	}
-	defer r.Close()
-
-	if r.Next() {
-		t.Fatal("unexpected row, want error")
+	if err == nil {
+		t.Fatal("Should have raised error")
 	}
-
-	_, ok := r.Err().(PGError)
+	_, ok := err.(*Error)
 	if !ok {
-		t.Fatalf("expected PGError, was: %#v", r.Err())
+		t.Fatalf("expected Error, was: %#v", err)
 	}
 
 	r, err = db.Query("SELECT 1 WHERE true = false") // returns no rows
@@ -348,6 +433,50 @@ func TestErrorOnQuery(t *testing.T) {
 
 	if r.Next() {
 		t.Fatal("unexpected row")
+	}
+}
+
+func TestErrorOnQueryRowSimpleQuery(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	sql := "DO $$BEGIN RAISE unique_violation USING MESSAGE='foo'; END; $$;"
+	r := db.QueryRow(sql)
+	var v int
+	err := r.Scan(&v)
+	if err == nil {
+		t.Fatal("Should have raised error")
+	}
+
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected Error, got %#v", err)
+	} else if e.Code.Name() != "unique_violation" {
+		t.Fatalf("expected unique_violation, got %s (%+v)", e.Code.Name(), err)
+	}
+}
+
+// Test the QueryRow bug workaround in exec
+func TestQueryRowBugWorkaround(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	_, err := db.Exec("CREATE TEMP TABLE notnulltemp (a varchar(10) not null)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var a string
+	err = db.QueryRow("INSERT INTO notnulltemp(a) values($1) RETURNING a", nil).Scan(&a)
+	if err == sql.ErrNoRows {
+		t.Errorf("expected constraint violation error; got: %v", err)
+	}
+	pge, ok := err.(*Error)
+	if !ok {
+		t.Errorf("expected *Error; got: %#v", err)
+	}
+	if pge.Code.Name() != "not_null_violation" {
+		t.Errorf("expected not_null_violation; got: %s (%+v)", pge.Code.Name(), err)
 	}
 }
 
@@ -388,12 +517,117 @@ func TestBindError(t *testing.T) {
 	defer r.Close()
 }
 
-func TestParseEnviron(t *testing.T) {
-	expected := map[string]string{"dbname": "hello", "user": "goodbye"}
-	results := parseEnviron([]string{"PGDATABASE=hello", "PGUSER=goodbye"})
-	if !reflect.DeepEqual(expected, results) {
-		t.Fatalf("Expected: %#v Got: %#v", expected, results)
+func TestParseErrorInExtendedQuery(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	rows, err := db.Query("PARSE_ERROR $1", 1)
+	if err == nil {
+		t.Fatal("expected error")
 	}
+
+	rows, err = db.Query("SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+}
+
+// TestReturning tests that an INSERT query using the RETURNING clause returns a row.
+func TestReturning(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	_, err := db.Exec("CREATE TEMP TABLE distributors (did integer default 0, dname text)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query("INSERT INTO distributors (did, dname) VALUES (DEFAULT, 'XYZ Widgets') " +
+		"RETURNING did;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatal("no rows")
+	}
+	var did int
+	err = rows.Scan(&did)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if did != 0 {
+		t.Fatalf("bad value for did: got %d, want %d", did, 0)
+	}
+
+	if rows.Next() {
+		t.Fatal("unexpected next row")
+	}
+	err = rows.Err()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+var envParseTests = []struct {
+	Expected map[string]string
+	Env      []string
+}{
+	{
+		Env:      []string{"PGDATABASE=hello", "PGUSER=goodbye"},
+		Expected: map[string]string{"dbname": "hello", "user": "goodbye"},
+	},
+	{
+		Env:      []string{"PGDATESTYLE=ISO, MDY"},
+		Expected: map[string]string{"datestyle": "ISO, MDY"},
+	},
+}
+
+func TestParseEnviron(t *testing.T) {
+	for i, tt := range envParseTests {
+		results := parseEnviron(tt.Env)
+		if !reflect.DeepEqual(tt.Expected, results) {
+			t.Errorf("%d: Expected: %#v Got: %#v", i, tt.Expected, results)
+		}
+	}
+}
+
+func TestParseComplete(t *testing.T) {
+	tpc := func(commandTag string, command string, affectedRows int64, shouldFail bool) {
+		defer func() {
+			if p := recover(); p != nil {
+				if !shouldFail {
+					t.Error(p)
+				}
+			}
+		}()
+		res, c := parseComplete(commandTag)
+		if c != command {
+			t.Errorf("Expected %v, got %v", command, c)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != affectedRows {
+			t.Errorf("Expected %d, got %d", affectedRows, n)
+		}
+	}
+
+	tpc("ALTER TABLE", "ALTER TABLE", 0, false)
+	tpc("INSERT 0 1", "INSERT", 1, false)
+	tpc("UPDATE 100", "UPDATE", 100, false)
+	tpc("SELECT 100", "SELECT", 100, false)
+	tpc("FETCH 100", "FETCH", 100, false)
+	// allow COPY (and others) without row count
+	tpc("COPY", "COPY", 0, false)
+	// don't fail on command tags we don't recognize
+	tpc("UNKNOWNCOMMANDTAG", "UNKNOWNCOMMANDTAG", 0, false)
+
+	// failure cases
+	tpc("INSERT 1", "", 0, true)   // missing oid
+	tpc("UPDATE 0 1", "", 0, true) // too many numbers
+	tpc("SELECT foo", "", 0, true) // invalid row count
 }
 
 func TestExecerInterface(t *testing.T) {
@@ -453,27 +687,6 @@ func TestNullAfterNonNull(t *testing.T) {
 	}
 }
 
-// Stress test the performance of parsing results from the wire.
-func BenchmarkResultParsing(b *testing.B) {
-	b.StopTimer()
-
-	db := openTestConn(b)
-	defer db.Close()
-	_, err := db.Exec("BEGIN")
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		res, err := db.Query("SELECT generate_series(1, 50000)")
-		if err != nil {
-			b.Fatal(err)
-		}
-		res.Close()
-	}
-}
-
 func Test64BitErrorChecking(t *testing.T) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -498,10 +711,7 @@ FROM (VALUES (0::integer, NULL::text), (1, 'test string')) AS t;`)
 	}
 }
 
-// Open transaction, issue INSERT query inside transaction, rollback
-// transaction, issue SELECT query to same db used to create the tx.  No rows
-// should be returned.
-func TestRollback(t *testing.T) {
+func TestCommit(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
@@ -515,54 +725,159 @@ func TestRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.Query(sqlInsert)
+	_, err = tx.Exec(sqlInsert)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = tx.Rollback()
+	err = tx.Commit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := db.Query(sqlSelect)
+	var i int
+	err = db.QueryRow(sqlSelect).Scan(&i)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Next() returns false if query returned no rows.
-	if r.Next() {
-		t.Fatal("Transaction rollback failed")
+	if i != 1 {
+		t.Fatalf("expected 1, got %d", i)
 	}
 }
 
 func TestParseOpts(t *testing.T) {
 	tests := []struct {
 		in       string
-		expected Values
+		expected values
 		valid    bool
 	}{
-		{"dbname=hello user=goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
-		{"dbname=hello user=goodbye  ", Values{"dbname": "hello", "user": "goodbye"}, true},
-		{"dbname = hello user=goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
-		{"dbname=hello user =goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
-		{"dbname=hello user= goodbye", Values{"dbname": "hello", "user": "goodbye"}, true},
-		{"host=localhost password='correct horse battery staple'", Values{"host": "localhost", "password": "correct horse battery staple"}, true},
-		{"dbname=データベース password=パスワード", Values{"dbname": "データベース", "password": "パスワード"}, true},
+		{"dbname=hello user=goodbye", values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname=hello user=goodbye  ", values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname = hello user=goodbye", values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname=hello user =goodbye", values{"dbname": "hello", "user": "goodbye"}, true},
+		{"dbname=hello user= goodbye", values{"dbname": "hello", "user": "goodbye"}, true},
+		{"host=localhost password='correct horse battery staple'", values{"host": "localhost", "password": "correct horse battery staple"}, true},
+		{"dbname=データベース password=パスワード", values{"dbname": "データベース", "password": "パスワード"}, true},
+		{"dbname=hello user=''", values{"dbname": "hello", "user": ""}, true},
+		{"user='' dbname=hello", values{"dbname": "hello", "user": ""}, true},
+		// The last option value is an empty string if there's no non-whitespace after its =
+		{"dbname=hello user=   ", values{"dbname": "hello", "user": ""}, true},
+
 		// The parser ignores spaces after = and interprets the next set of non-whitespace characters as the value.
-		// This seems to be how the C library does it.
-		{"user= password=foo", Values{"user": "password=foo"}, true},
+		{"user= password=foo", values{"user": "password=foo"}, true},
 
 		// No '=' after the key
-		{"dbname user=goodbye", Values{}, false},
+		{"postgre://marko@internet", values{}, false},
+		{"dbname user=goodbye", values{}, false},
+		{"user=foo blah", values{}, false},
+		{"user=foo blah   ", values{}, false},
+
 		// Unterminated quoted value
-		{"dbname=hello user='unterminated", Values{}, false},
+		{"dbname=hello user='unterminated", values{}, false},
 	}
 
 	for _, test := range tests {
-		o := make(Values)
+		o := make(values)
 		err := parseOpts(test.in, o)
-		if err != nil && test.valid {
+
+		switch {
+		case err != nil && test.valid:
 			t.Errorf("%q got unexpected error: %s", test.in, err)
-		} else if err == nil && !reflect.DeepEqual(test.expected, o) {
+		case err == nil && test.valid && !reflect.DeepEqual(test.expected, o):
 			t.Errorf("%q got: %#v want: %#v", test.in, o, test.expected)
+		case err == nil && !test.valid:
+			t.Errorf("%q expected an error", test.in)
+		}
+	}
+}
+
+func TestRuntimeParameters(t *testing.T) {
+	type RuntimeTestResult int
+	const (
+		ResultBadConn RuntimeTestResult = iota
+		ResultPanic
+		ResultSuccess
+		ResultError // other error
+	)
+
+	tests := []struct {
+		conninfo        string
+		param           string
+		expected        string
+		expectedOutcome RuntimeTestResult
+	}{
+		// invalid parameter
+		{"DOESNOTEXIST=foo", "", "", ResultBadConn},
+		// we can only work with a specific value for these two
+		{"client_encoding=SQL_ASCII", "", "", ResultError},
+		{"datestyle='ISO, YDM'", "", "", ResultPanic},
+		// "options" should work exactly as it does in libpq
+		{"options='-c search_path=pqgotest'", "search_path", "pqgotest", ResultSuccess},
+		// pq should override client_encoding in this case
+		{"options='-c client_encoding=SQL_ASCII'", "client_encoding", "UTF8", ResultSuccess},
+		// allow client_encoding to be set explicitly
+		{"client_encoding=UTF8", "client_encoding", "UTF8", ResultSuccess},
+		// test a runtime parameter not supported by libpq
+		{"work_mem='139kB'", "work_mem", "139kB", ResultSuccess},
+	}
+
+	for _, test := range tests {
+		db, err := openTestConnConninfo(test.conninfo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		tryGetParameterValue := func() (value string, outcome RuntimeTestResult) {
+			defer func() {
+				if p := recover(); p != nil {
+					outcome = ResultPanic
+				}
+			}()
+			row := db.QueryRow("SELECT current_setting($1)", test.param)
+			err = row.Scan(&value)
+			if err == driver.ErrBadConn {
+				return "", ResultBadConn
+			}
+			if err != nil {
+				return "", ResultError
+			}
+			return value, ResultSuccess
+		}
+
+		value, outcome := tryGetParameterValue()
+		if outcome != test.expectedOutcome && outcome == ResultError {
+			t.Fatalf("%v: unexpected error: %v", test.conninfo, err)
+		}
+		if outcome != test.expectedOutcome {
+			t.Fatalf("unexpected outcome %v (was expecting %v) for conninfo \"%s\"",
+				outcome, test.expectedOutcome, test.conninfo)
+		}
+		if value != test.expected {
+			t.Fatalf("bad value for %s: got %s, want %s with conninfo \"%s\"",
+				test.param, value, test.expected, test.conninfo)
+		}
+	}
+}
+
+func TestIsUTF8(t *testing.T) {
+	var cases = []struct {
+		name string
+		want bool
+	}{
+		{"unicode", true},
+		{"utf-8", true},
+		{"utf_8", true},
+		{"UTF-8", true},
+		{"UTF8", true},
+		{"utf8", true},
+		{"u n ic_ode", true},
+		{"ut_f%8", true},
+		{"ubf8", false},
+		{"punycode", false},
+	}
+
+	for _, test := range cases {
+		if g := isUTF8(test.name); g != test.want {
+			t.Errorf("isUTF8(%q) = %v want %v", test.name, g, test.want)
 		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 var (
@@ -89,7 +90,7 @@ func fakeConn(content string, prefixLen int) *conn {
 func BenchmarkMockSelectString(b *testing.B) {
 	b.StopTimer()
 	// taken from a recorded run of BenchmarkSelectString
-	// See: http://www.postgresql.org/docs/9.2/static/protocol-message-formats.html
+	// See: http://www.postgresql.org/docs/current/static/protocol-message-formats.html
 	const response = "1\x00\x00\x00\x04" +
 		"t\x00\x00\x00\x06\x00\x00" +
 		"T\x00\x00\x00!\x00\x01?column?\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\xc1\xff\xfe\xff\xff\xff\xff\x00\x00" +
@@ -305,6 +306,14 @@ func BenchmarkEncodeBool(b *testing.B) {
 	}
 }
 
+var testTimestamptz = time.Date(2001, time.January, 1, 0, 0, 0, 0, time.Local)
+
+func BenchmarkEncodeTimestamptz(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		encode(testTimestamptz, oid.T_timestamptz)
+	}
+}
+
 var testIntBytes = []byte("1234")
 
 func BenchmarkDecodeInt64(b *testing.B) {
@@ -336,4 +345,33 @@ func TestDecodeBool(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows.Close()
+}
+
+var testTimestamptzBytes = []byte("2013-09-17 22:15:32.360754-07")
+
+func BenchmarkDecodeTimestamptz(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		decode(testTimestamptzBytes, oid.T_timestamptz)
+	}
+}
+
+// Stress test the performance of parsing results from the wire.
+func BenchmarkResultParsing(b *testing.B) {
+	b.StopTimer()
+
+	db := openTestConn(b)
+	defer db.Close()
+	_, err := db.Exec("BEGIN")
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		res, err := db.Query("SELECT generate_series(1, 50000)")
+		if err != nil {
+			b.Fatal(err)
+		}
+		res.Close()
+	}
 }

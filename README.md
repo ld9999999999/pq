@@ -8,48 +8,8 @@
 
 ## Docs
 
-<http://godoc.org/github.com/lib/pq>
-
-## Use
-
-	package main
-
-	import (
-		_ "github.com/lib/pq"
-		"database/sql"
-	)
-
-	func main() {
-		db, err := sql.Open("postgres", "user=pqgotest dbname=pqgotest sslmode=verify-full")
-		// ...
-	}
-
-**Connection String Parameters**
-
-These are a subset of the libpq connection parameters.  In addition, a
-number of the [environment
-variables](http://www.postgresql.org/docs/9.1/static/libpq-envars.html)
-supported by libpq are also supported.  Just like libpq, these have
-lower precedence than explicitly provided connection parameters.
-
-See http://www.postgresql.org/docs/9.1/static/libpq-connect.html.
-
-* `dbname` - The name of the database to connect to
-* `user` - The user to sign in as
-* `password` - The user's password
-* `host` - The host to connect to. Values that start with `/` are for unix domain sockets. (default is `localhost`)
-* `port` - The port to bind to. (default is `5432`)
-* `sslmode` - Whether or not to use SSL (default is `require`, this is not the default for libpq)
-	Valid values are:
-	* `disable` - No SSL
-	* `require` - Always SSL (skip verification)
-	* `verify-full` - Always SSL (require verification)
-
-Use single quotes for values that contain whitespace:
-
-    "user=pqgotest password='with spaces'"
-
-See http://golang.org/pkg/database/sql to learn how to use with `pq` through the `database/sql` package.
+For detailed documentation and basic usage examples, please see the package
+documentation at <http://godoc.org/github.com/lib/pq>.
 
 ## Tests
 
@@ -104,12 +64,16 @@ code still exists in here.
 * Joakim Sernbrant (serbaut)
 * John Gallagher (jgallagher)
 * Kamil Kisiel (kisielk)
+* Kelly Dunn (kellydunn)
 * Keith Rarick (kr)
 * Maciek Sakrejda (deafbybeheading)
 * Marc Brinkmann (mbr)
+* Marko Tiikkaja (johto)
 * Matt Robenolt (mattrobenolt)
 * Martin Olsen (martinolsen)
 * Mike Lewis (mikelikespie)
+* Nicolas Patry (Narsil)
+* Paul Hammond (paulhammond)
 * Ryan Smith (ryandotsmith)
 * Samuel Stauffer (samuel)
 * notedit (notedit)
